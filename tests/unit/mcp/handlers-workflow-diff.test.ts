@@ -73,6 +73,9 @@ describe('handlers-workflow-diff', () => {
     mockApiClient = {
       getWorkflow: vi.fn(),
       updateWorkflow: vi.fn(),
+      listTags: vi.fn().mockResolvedValue({ data: [] }),
+      createTag: vi.fn(),
+      updateWorkflowTags: vi.fn().mockResolvedValue([]),
     };
 
     // Setup mock diff engine
@@ -150,15 +153,20 @@ describe('handlers-workflow-diff', () => {
 
       expect(result).toEqual({
         success: true,
-        data: updatedWorkflow,
-        message: 'Workflow "Test Workflow" updated successfully. Applied 1 operations.',
-        details: {
+        saved: true,
+        data: {
+          id: 'test-workflow-id',
+          name: 'Test Workflow',
+          active: true,
+          nodeCount: 3,
           operationsApplied: 1,
-          workflowId: 'test-workflow-id',
-          workflowName: 'Test Workflow',
+        },
+        message: 'Workflow "Test Workflow" updated successfully. Applied 1 operations. Use n8n_get_workflow with mode \'structure\' to verify current state.',
+        details: {
           applied: [0],
           failed: [],
           errors: [],
+          warnings: undefined,
         },
       });
 
@@ -305,10 +313,12 @@ describe('handlers-workflow-diff', () => {
 
       expect(result).toEqual({
         success: false,
+        saved: false,
+        operationsApplied: 0,
         error: 'Failed to apply diff operations',
         details: {
           errors: ['Node "non-existent-node" not found'],
-          operationsApplied: 0,
+          warnings: undefined,
           applied: [],
           failed: [0],
         },
@@ -626,11 +636,486 @@ describe('handlers-workflow-diff', () => {
 
       expect(result).toEqual({
         success: false,
+        saved: false,
+        operationsApplied: 1,
         error: 'Failed to apply diff operations',
         details: {
           errors: ['Operation 2 failed: Node "invalid-node" not found'],
-          operationsApplied: 1,
+          warnings: undefined,
+          applied: undefined,
+          failed: undefined,
         },
+      });
+    });
+
+    describe('Workflow Activation/Deactivation', () => {
+      it('should activate workflow after successful update', async () => {
+        const testWorkflow = createTestWorkflow({ active: false });
+        const updatedWorkflow = { ...testWorkflow, active: false };
+        const activatedWorkflow = { ...testWorkflow, active: true };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldActivate: true,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.activateWorkflow = vi.fn().mockResolvedValue(activatedWorkflow);
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'activateWorkflow' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(result.data).toEqual({
+          id: 'test-workflow-id',
+          name: 'Test Workflow',
+          active: true,
+          nodeCount: 2,
+          operationsApplied: 1,
+        });
+        expect(result.message).toContain('Workflow activated');
+        expect((result.data as any).active).toBe(true);
+        expect(mockApiClient.activateWorkflow).toHaveBeenCalledWith('test-workflow-id');
+      });
+
+      it('should deactivate workflow after successful update', async () => {
+        const testWorkflow = createTestWorkflow({ active: true });
+        const updatedWorkflow = { ...testWorkflow, active: true };
+        const deactivatedWorkflow = { ...testWorkflow, active: false };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldDeactivate: true,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.deactivateWorkflow = vi.fn().mockResolvedValue(deactivatedWorkflow);
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'deactivateWorkflow' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(result.data).toEqual({
+          id: 'test-workflow-id',
+          name: 'Test Workflow',
+          active: false,
+          nodeCount: 2,
+          operationsApplied: 1,
+        });
+        expect(result.message).toContain('Workflow deactivated');
+        expect((result.data as any).active).toBe(false);
+        expect(mockApiClient.deactivateWorkflow).toHaveBeenCalledWith('test-workflow-id');
+      });
+
+      it('should handle activation failure after successful update', async () => {
+        const testWorkflow = createTestWorkflow({ active: false });
+        const updatedWorkflow = { ...testWorkflow, active: false };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldActivate: true,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.activateWorkflow = vi.fn().mockRejectedValue(new Error('Activation failed: No trigger nodes'));
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'activateWorkflow' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('Workflow updated successfully but activation failed');
+        expect(result.details).toEqual({
+          workflowUpdated: true,
+          activationError: 'Activation failed: No trigger nodes',
+        });
+      });
+
+      it('should handle deactivation failure after successful update', async () => {
+        const testWorkflow = createTestWorkflow({ active: true });
+        const updatedWorkflow = { ...testWorkflow, active: true };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldDeactivate: true,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.deactivateWorkflow = vi.fn().mockRejectedValue(new Error('Deactivation failed'));
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'deactivateWorkflow' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('Workflow updated successfully but deactivation failed');
+        expect(result.details).toEqual({
+          workflowUpdated: true,
+          deactivationError: 'Deactivation failed',
+        });
+      });
+
+      it('should update workflow without activation when shouldActivate is false', async () => {
+        const testWorkflow = createTestWorkflow({ active: false });
+        const updatedWorkflow = { ...testWorkflow, active: false };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldActivate: false,
+          shouldDeactivate: false,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.activateWorkflow = vi.fn();
+        mockApiClient.deactivateWorkflow = vi.fn();
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'updateName', name: 'Updated' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(result.message).not.toContain('activated');
+        expect(result.message).not.toContain('deactivated');
+        expect(mockApiClient.activateWorkflow).not.toHaveBeenCalled();
+        expect(mockApiClient.deactivateWorkflow).not.toHaveBeenCalled();
+      });
+
+      it('should handle non-Error activation failures', async () => {
+        const testWorkflow = createTestWorkflow({ active: false });
+        const updatedWorkflow = { ...testWorkflow, active: false };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldActivate: true,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.activateWorkflow = vi.fn().mockRejectedValue('String error');
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'activateWorkflow' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('Workflow updated successfully but activation failed');
+        expect(result.details).toEqual({
+          workflowUpdated: true,
+          activationError: 'Unknown error',
+        });
+      });
+
+      it('should handle non-Error deactivation failures', async () => {
+        const testWorkflow = createTestWorkflow({ active: true });
+        const updatedWorkflow = { ...testWorkflow, active: true };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          shouldDeactivate: true,
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.deactivateWorkflow = vi.fn().mockRejectedValue({ code: 'UNKNOWN' });
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'deactivateWorkflow' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('Workflow updated successfully but deactivation failed');
+        expect(result.details).toEqual({
+          workflowUpdated: true,
+          deactivationError: 'Unknown error',
+        });
+      });
+    });
+
+    describe('Tag Operations via Dedicated API', () => {
+      it('should create a new tag and associate it with the workflow', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          tagsToAdd: ['new-tag'],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.listTags.mockResolvedValue({ data: [] });
+        mockApiClient.createTag.mockResolvedValue({ id: 'tag-123', name: 'new-tag' });
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'addTag', tag: 'new-tag' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(mockApiClient.createTag).toHaveBeenCalledWith({ name: 'new-tag' });
+        expect(mockApiClient.updateWorkflowTags).toHaveBeenCalledWith('test-workflow-id', ['tag-123']);
+      });
+
+      it('should use existing tag ID when tag already exists', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          tagsToAdd: ['existing-tag'],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.listTags.mockResolvedValue({ data: [{ id: 'tag-456', name: 'existing-tag' }] });
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'addTag', tag: 'existing-tag' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(mockApiClient.createTag).not.toHaveBeenCalled();
+        expect(mockApiClient.updateWorkflowTags).toHaveBeenCalledWith('test-workflow-id', ['tag-456']);
+      });
+
+      it('should remove a tag from the workflow', async () => {
+        const testWorkflow = createTestWorkflow({
+          tags: [{ id: 'tag-789', name: 'old-tag' }],
+        });
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          tagsToRemove: ['old-tag'],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.listTags.mockResolvedValue({ data: [{ id: 'tag-789', name: 'old-tag' }] });
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'removeTag', tag: 'old-tag' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(mockApiClient.updateWorkflowTags).toHaveBeenCalledWith('test-workflow-id', []);
+      });
+
+      it('should produce warning on tag creation failure without failing the operation', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+          tagsToAdd: ['fail-tag'],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+        mockApiClient.listTags.mockResolvedValue({ data: [] });
+        mockApiClient.createTag.mockRejectedValue(new Error('Tag creation failed'));
+
+        const result = await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'addTag', tag: 'fail-tag' }],
+        }, mockRepository);
+
+        expect(result.success).toBe(true);
+        expect(result.saved).toBe(true);
+        // Tag creation failure should produce a warning, not block the update
+        const warnings = (result.details as any)?.warnings;
+        expect(warnings).toBeDefined();
+        expect(warnings.some((w: any) => w.message.includes('Failed to create tag'))).toBe(true);
+      });
+
+      it('should not call tag APIs when no tag operations are present', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+
+        await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{ type: 'updateName', name: 'New Name' }],
+        }, mockRepository);
+
+        expect(mockApiClient.listTags).not.toHaveBeenCalled();
+        expect(mockApiClient.createTag).not.toHaveBeenCalled();
+        expect(mockApiClient.updateWorkflowTags).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('field name normalization', () => {
+      it('should normalize "name" to "nodeName" for updateNode operations', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+
+        await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{
+            type: 'updateNode',
+            name: 'HTTP Request',  // LLMs often use "name" instead of "nodeName"
+            updates: { 'parameters.url': 'https://new-url.com' },
+          }],
+        }, mockRepository);
+
+        // Verify the diff engine received nodeName (normalized from name)
+        expect(mockDiffEngine.applyDiff).toHaveBeenCalled();
+        const diffArgs = mockDiffEngine.applyDiff.mock.calls[0][1];
+        expect(diffArgs.operations[0].nodeName).toBe('HTTP Request');
+      });
+
+      it('should normalize "id" to "nodeId" for removeNode operations', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+
+        await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{
+            type: 'removeNode',
+            id: 'node2',  // LLMs may use "id" instead of "nodeId"
+          }],
+        }, mockRepository);
+
+        // Verify the diff engine received nodeId (normalized from id)
+        expect(mockDiffEngine.applyDiff).toHaveBeenCalled();
+        const diffArgs = mockDiffEngine.applyDiff.mock.calls[0][1];
+        expect(diffArgs.operations[0].nodeId).toBe('node2');
+      });
+
+      it('should NOT normalize "name" for updateName operations', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+
+        await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{
+            type: 'updateName',
+            name: 'New Workflow Name',  // This is the correct field for updateName
+          }],
+        }, mockRepository);
+
+        // Verify "name" stays as "name" (not moved to nodeName) for updateName
+        expect(mockDiffEngine.applyDiff).toHaveBeenCalled();
+        const diffArgs = mockDiffEngine.applyDiff.mock.calls[0][1];
+        expect(diffArgs.operations[0].name).toBe('New Workflow Name');
+        expect(diffArgs.operations[0].nodeName).toBeUndefined();
+      });
+
+      it('should prefer explicit "nodeName" over "name" alias', async () => {
+        const testWorkflow = createTestWorkflow();
+        const updatedWorkflow = { ...testWorkflow };
+
+        mockApiClient.getWorkflow.mockResolvedValue(testWorkflow);
+        mockDiffEngine.applyDiff.mockResolvedValue({
+          success: true,
+          workflow: updatedWorkflow,
+          operationsApplied: 1,
+          message: 'Success',
+          errors: [],
+        });
+        mockApiClient.updateWorkflow.mockResolvedValue(updatedWorkflow);
+
+        await handleUpdatePartialWorkflow({
+          id: 'test-workflow-id',
+          operations: [{
+            type: 'updateNode',
+            nodeName: 'HTTP Request',  // Explicit nodeName provided
+            name: 'Should Be Ignored',  // Should NOT override nodeName
+            updates: { 'parameters.url': 'https://new-url.com' },
+          }],
+        }, mockRepository);
+
+        expect(mockDiffEngine.applyDiff).toHaveBeenCalled();
+        const diffArgs = mockDiffEngine.applyDiff.mock.calls[0][1];
+        expect(diffArgs.operations[0].nodeName).toBe('HTTP Request');
       });
     });
   });

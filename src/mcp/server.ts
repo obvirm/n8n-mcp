@@ -1,24 +1,29 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { 
-  CallToolRequestSchema, 
+import {
+  CallToolRequestSchema,
   ListToolsRequestSchema,
   InitializeRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { existsSync, promises as fs } from 'fs';
 import path from 'path';
 import { n8nDocumentationToolsFinal } from './tools';
+import { UIAppRegistry } from './ui';
 import { n8nManagementTools } from './tools-n8n-manager';
 import { makeToolsN8nFriendly } from './tools-n8n-friendly';
 import { getWorkflowExampleString } from './workflow-examples';
 import { logger } from '../utils/logger';
 import { NodeRepository } from '../database/node-repository';
 import { DatabaseAdapter, createDatabaseAdapter } from '../database/database-adapter';
+import { getSharedDatabase, releaseSharedDatabase, SharedDatabaseState } from '../database/shared-database';
 import { PropertyFilter } from '../services/property-filter';
 import { TaskTemplates } from '../services/task-templates';
 import { ConfigValidator } from '../services/config-validator';
 import { EnhancedConfigValidator, ValidationMode, ValidationProfile } from '../services/enhanced-config-validator';
 import { PropertyDependencies } from '../services/property-dependencies';
+import { TypeStructureService } from '../services/type-structure-service';
 import { SimpleCache } from '../utils/simple-cache';
 import { TemplateService } from '../templates/template-service';
 import { WorkflowValidator } from '../services/workflow-validator';
@@ -51,12 +56,90 @@ interface NodeRow {
   is_trigger: number;
   is_webhook: number;
   is_versioned: number;
+  is_tool_variant: number;
+  tool_variant_of?: string;
+  has_tool_variant: number;
   version?: string;
   documentation?: string;
   properties_schema?: string;
   operations?: string;
   credentials_required?: string;
+  // AI documentation fields
+  ai_documentation_summary?: string;
+  ai_summary_generated_at?: string;
 }
+
+interface VersionSummary {
+  currentVersion: string;
+  totalVersions: number;
+  hasVersionHistory: boolean;
+}
+
+interface ToolVariantGuidance {
+  isToolVariant: boolean;
+  toolVariantOf?: string;
+  hasToolVariant: boolean;
+  toolVariantNodeType?: string;
+  guidance?: string;
+}
+
+interface NodeMinimalInfo {
+  nodeType: string;
+  workflowNodeType: string;
+  displayName: string;
+  description: string;
+  category: string;
+  package: string;
+  isAITool: boolean;
+  isTrigger: boolean;
+  isWebhook: boolean;
+  toolVariantInfo?: ToolVariantGuidance;
+}
+
+interface NodeStandardInfo {
+  nodeType: string;
+  displayName: string;
+  description: string;
+  category: string;
+  requiredProperties: any[];
+  commonProperties: any[];
+  operations?: any[];
+  credentials?: any;
+  examples?: any[];
+  versionInfo: VersionSummary;
+  toolVariantInfo?: ToolVariantGuidance;
+}
+
+interface NodeFullInfo {
+  nodeType: string;
+  displayName: string;
+  description: string;
+  category: string;
+  properties: any[];
+  operations?: any[];
+  credentials?: any;
+  documentation?: string;
+  versionInfo: VersionSummary;
+  toolVariantInfo?: ToolVariantGuidance;
+}
+
+interface VersionHistoryInfo {
+  nodeType: string;
+  versions: any[];
+  latestVersion: string;
+  hasBreakingChanges: boolean;
+}
+
+interface VersionComparisonInfo {
+  nodeType: string;
+  fromVersion: string;
+  toVersion: string;
+  changes: any[];
+  breakingChanges?: any[];
+  migrations?: any[];
+}
+
+type NodeInfoResponse = NodeMinimalInfo | NodeStandardInfo | NodeFullInfo | VersionHistoryInfo | VersionComparisonInfo;
 
 export class N8NDocumentationMCPServer {
   private server: Server;
@@ -70,6 +153,10 @@ export class N8NDocumentationMCPServer {
   private previousTool: string | null = null;
   private previousToolTimestamp: number = Date.now();
   private earlyLogger: EarlyErrorLogger | null = null;
+  private disabledToolsCache: Set<string> | null = null;
+  private useSharedDatabase: boolean = false;  // Track if using shared DB for cleanup
+  private sharedDbState: SharedDatabaseState | null = null;  // Reference to shared DB state for release
+  private isShutdown: boolean = false;  // Prevent double-shutdown
 
   constructor(instanceContext?: InstanceContext, earlyLogger?: EarlyErrorLogger) {
     this.instanceContext = instanceContext;
@@ -123,6 +210,13 @@ export class N8NDocumentationMCPServer {
       }
     });
 
+    // Attach a no-op catch handler to prevent Node.js from flagging this as an
+    // unhandled rejection in the interval between construction and the first
+    // await of this.initialized (via ensureInitialized). This does NOT suppress
+    // the error: the original this.initialized promise still rejects, and
+    // ensureInitialized() will re-throw it when awaited.
+    this.initialized.catch(() => {});
+
     logger.info('Initializing n8n Documentation MCP server');
     
     this.server = new Server(
@@ -151,13 +245,76 @@ export class N8NDocumentationMCPServer {
       {
         capabilities: {
           tools: {},
+          resources: {},
         },
       }
     );
 
+    UIAppRegistry.load();
     this.setupHandlers();
   }
-  
+
+  /**
+   * Close the server and release resources.
+   * Should be called when the session is being removed.
+   *
+   * Order of cleanup:
+   * 1. Close MCP server connection
+   * 2. Destroy cache (clears entries AND stops cleanup timer)
+   * 3. Release shared database OR close dedicated connection
+   * 4. Null out references to help GC
+   *
+   * IMPORTANT: For shared databases, we only release the reference (decrement refCount),
+   * NOT close the database. The database stays open for other sessions.
+   * For in-memory databases (tests), we close the dedicated connection.
+   */
+  async close(): Promise<void> {
+    // Wait for initialization to complete (or fail) before cleanup
+    // This prevents race conditions where close runs while init is in progress
+    try {
+      await this.initialized;
+    } catch (error) {
+      // Initialization failed - that's OK, we still need to clean up
+      logger.debug('Initialization had failed, proceeding with cleanup', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    try {
+      await this.server.close();
+
+      // Use destroy() not clear() - also stops the cleanup timer
+      this.cache.destroy();
+
+      // Handle database cleanup based on whether it's shared or dedicated
+      if (this.useSharedDatabase && this.sharedDbState) {
+        // Shared database: release reference, don't close
+        // The database stays open for other sessions
+        releaseSharedDatabase(this.sharedDbState);
+        logger.debug('Released shared database reference');
+      } else if (this.db) {
+        // Dedicated database (in-memory for tests): close it
+        try {
+          this.db.close();
+        } catch (dbError) {
+          logger.warn('Error closing database', {
+            error: dbError instanceof Error ? dbError.message : String(dbError)
+          });
+        }
+      }
+
+      // Null out references to help garbage collection
+      this.db = null;
+      this.repository = null;
+      this.templateService = null;
+      this.earlyLogger = null;
+      this.sharedDbState = null;
+    } catch (error) {
+      // Log but don't throw - cleanup should be best-effort
+      logger.warn('Error closing MCP server', { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
   private async initializeDatabase(dbPath: string): Promise<void> {
     try {
       // Checkpoint: Database connecting (v2.18.3)
@@ -167,23 +324,32 @@ export class N8NDocumentationMCPServer {
 
       logger.debug('Database initialization starting...', { dbPath });
 
-      this.db = await createDatabaseAdapter(dbPath);
-      logger.debug('Database adapter created');
-
-      // If using in-memory database for tests, initialize schema
+      // For in-memory databases (tests), create a dedicated connection
+      // For regular databases, use the shared connection to prevent memory leaks
       if (dbPath === ':memory:') {
+        this.db = await createDatabaseAdapter(dbPath);
+        logger.debug('Database adapter created (in-memory mode)');
         await this.initializeInMemorySchema();
         logger.debug('In-memory schema initialized');
+        this.repository = new NodeRepository(this.db);
+        this.templateService = new TemplateService(this.db);
+        // Initialize similarity services for enhanced validation
+        EnhancedConfigValidator.initializeSimilarityServices(this.repository);
+        this.useSharedDatabase = false;
+      } else {
+        // Use shared database connection to prevent ~900MB memory leak per session
+        // See: Memory leak fix - database was being duplicated per session
+        const sharedState = await getSharedDatabase(dbPath);
+        this.db = sharedState.db;
+        this.repository = sharedState.repository;
+        this.templateService = sharedState.templateService;
+        this.sharedDbState = sharedState;
+        this.useSharedDatabase = true;
+        logger.debug('Using shared database connection');
       }
 
-      this.repository = new NodeRepository(this.db);
       logger.debug('Node repository initialized');
-
-      this.templateService = new TemplateService(this.db);
       logger.debug('Template service initialized');
-
-      // Initialize similarity services for enhanced validation
-      EnhancedConfigValidator.initializeSimilarityServices(this.repository);
       logger.debug('Similarity services initialized');
 
       // Checkpoint: Database connected (v2.18.3)
@@ -296,19 +462,24 @@ export class N8NDocumentationMCPServer {
         throw new Error('Database is empty. Run "npm run rebuild" to populate node data.');
       }
 
-      // Check if FTS5 table exists
-      const ftsExists = this.db.prepare(`
-        SELECT name FROM sqlite_master
-        WHERE type='table' AND name='nodes_fts'
-      `).get();
+      // Check if FTS5 table exists (wrap in try-catch for sql.js compatibility)
+      try {
+        const ftsExists = this.db.prepare(`
+          SELECT name FROM sqlite_master
+          WHERE type='table' AND name='nodes_fts'
+        `).get();
 
-      if (!ftsExists) {
-        logger.warn('FTS5 table missing - search performance will be degraded. Please run: npm run rebuild');
-      } else {
-        const ftsCount = this.db.prepare('SELECT COUNT(*) as count FROM nodes_fts').get() as { count: number };
-        if (ftsCount.count === 0) {
-          logger.warn('FTS5 index is empty - search will not work properly. Please run: npm run rebuild');
+        if (!ftsExists) {
+          logger.warn('FTS5 table missing - search performance will be degraded. Please run: npm run rebuild');
+        } else {
+          const ftsCount = this.db.prepare('SELECT COUNT(*) as count FROM nodes_fts').get() as { count: number };
+          if (ftsCount.count === 0) {
+            logger.warn('FTS5 index is empty - search will not work properly. Please run: npm run rebuild');
+          }
         }
+      } catch (ftsError) {
+        // FTS5 not supported (e.g., sql.js fallback) - this is OK, just warn
+        logger.warn('FTS5 not available - using fallback search. For better performance, ensure better-sqlite3 is properly installed.');
       }
 
       logger.info(`Database health check passed: ${nodeCount.count} nodes loaded`);
@@ -316,6 +487,52 @@ export class N8NDocumentationMCPServer {
       logger.error('Database health check failed:', error);
       throw error;
     }
+  }
+
+  /**
+   * Parse and cache disabled tools from DISABLED_TOOLS environment variable.
+   * Returns a Set of tool names that should be filtered from registration.
+   *
+   * Cached after first call since environment variables don't change at runtime.
+   * Includes safety limits: max 10KB env var length, max 200 tools.
+   *
+   * @returns Set of disabled tool names
+   */
+  private getDisabledTools(): Set<string> {
+    // Return cached value if available
+    if (this.disabledToolsCache !== null) {
+      return this.disabledToolsCache;
+    }
+
+    let disabledToolsEnv = process.env.DISABLED_TOOLS || '';
+    if (!disabledToolsEnv) {
+      this.disabledToolsCache = new Set();
+      return this.disabledToolsCache;
+    }
+
+    // Safety limit: prevent abuse with very long environment variables
+    if (disabledToolsEnv.length > 10000) {
+      logger.warn(`DISABLED_TOOLS environment variable too long (${disabledToolsEnv.length} chars), truncating to 10000`);
+      disabledToolsEnv = disabledToolsEnv.substring(0, 10000);
+    }
+
+    let tools = disabledToolsEnv
+      .split(',')
+      .map(t => t.trim())
+      .filter(Boolean);
+
+    // Safety limit: prevent abuse with too many tools
+    if (tools.length > 200) {
+      logger.warn(`DISABLED_TOOLS contains ${tools.length} tools, limiting to first 200`);
+      tools = tools.slice(0, 200);
+    }
+
+    if (tools.length > 0) {
+      logger.info(`Disabled tools configured: ${tools.join(', ')}`);
+    }
+
+    this.disabledToolsCache = new Set(tools);
+    return this.disabledToolsCache;
   }
 
   private setupHandlers(): void {
@@ -358,6 +575,7 @@ export class N8NDocumentationMCPServer {
         protocolVersion: negotiationResult.version,
         capabilities: {
           tools: {},
+          resources: {},
         },
         serverInfo: {
           name: 'n8n-documentation-mcp',
@@ -371,8 +589,16 @@ export class N8NDocumentationMCPServer {
 
     // Handle tool listing
     this.server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+      // Get disabled tools from environment variable
+      const disabledTools = this.getDisabledTools();
+
+      // Filter documentation tools based on disabled list
+      const enabledDocTools = n8nDocumentationToolsFinal.filter(
+        tool => !disabledTools.has(tool.name)
+      );
+
       // Combine documentation tools with management tools if API is configured
-      let tools = [...n8nDocumentationToolsFinal];
+      let tools = [...enabledDocTools];
 
       // Check if n8n API tools should be available
       // 1. Environment variables (backward compatibility)
@@ -385,18 +611,30 @@ export class N8NDocumentationMCPServer {
       const shouldIncludeManagementTools = hasEnvConfig || hasInstanceConfig || isMultiTenantEnabled;
 
       if (shouldIncludeManagementTools) {
-        tools.push(...n8nManagementTools);
-        logger.debug(`Tool listing: ${tools.length} tools available (${n8nDocumentationToolsFinal.length} documentation + ${n8nManagementTools.length} management)`, {
+        // Filter management tools based on disabled list
+        const enabledMgmtTools = n8nManagementTools.filter(
+          tool => !disabledTools.has(tool.name)
+        );
+        tools.push(...enabledMgmtTools);
+        logger.debug(`Tool listing: ${tools.length} tools available (${enabledDocTools.length} documentation + ${enabledMgmtTools.length} management)`, {
           hasEnvConfig,
           hasInstanceConfig,
-          isMultiTenantEnabled
+          isMultiTenantEnabled,
+          disabledToolsCount: disabledTools.size
         });
       } else {
         logger.debug(`Tool listing: ${tools.length} tools available (documentation only)`, {
           hasEnvConfig,
           hasInstanceConfig,
-          isMultiTenantEnabled
+          isMultiTenantEnabled,
+          disabledToolsCount: disabledTools.size
         });
+      }
+
+      // Log filtered tools count if any tools are disabled
+      if (disabledTools.size > 0) {
+        const totalAvailableTools = n8nDocumentationToolsFinal.length + (shouldIncludeManagementTools ? n8nManagementTools.length : 0);
+        logger.debug(`Filtered ${disabledTools.size} disabled tools, ${tools.length}/${totalAvailableTools} tools available`);
       }
       
       // Check if client is n8n (from initialization)
@@ -420,6 +658,7 @@ export class N8NDocumentationMCPServer {
         });
       });
       
+      UIAppRegistry.injectToolMeta(tools);
       return { tools };
     });
 
@@ -438,10 +677,40 @@ export class N8NDocumentationMCPServer {
         configType: args && args.config ? typeof args.config : 'N/A',
         rawRequest: JSON.stringify(request.params)
       });
-      
+
+      // Check if tool is disabled via DISABLED_TOOLS environment variable
+      const disabledTools = this.getDisabledTools();
+      if (disabledTools.has(name)) {
+        logger.warn(`Attempted to call disabled tool: ${name}`);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error: 'TOOL_DISABLED',
+              message: `Tool '${name}' is not available in this deployment. It has been disabled via DISABLED_TOOLS environment variable.`,
+              tool: name
+            }, null, 2)
+          }]
+        };
+      }
+
+      // Safeguard: if the entire args object arrives as a JSON string, parse it.
+      // Some MCP clients may serialize the arguments object itself.
+      let processedArgs: Record<string, any> | undefined = args;
+      if (typeof args === 'string') {
+        try {
+          const parsed = JSON.parse(args as unknown as string);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            processedArgs = parsed;
+            logger.warn(`Coerced stringified args object for tool "${name}"`);
+          }
+        } catch {
+          logger.warn(`Tool "${name}" received string args that are not valid JSON`);
+        }
+      }
+
       // Workaround for n8n's nested output bug
       // Check if args contains nested 'output' structure from n8n's memory corruption
-      let processedArgs = args;
       if (args && typeof args === 'object' && 'output' in args) {
         try {
           const possibleNestedData = args.output;
@@ -472,7 +741,13 @@ export class N8NDocumentationMCPServer {
           });
         }
       }
-      
+
+      // Workaround for Claude Desktop / Claude.ai MCP client bugs that
+      // serialize parameters with wrong types. Coerces ALL mismatched types
+      // (string↔object, string↔number, string↔boolean, etc.) using the
+      // tool's inputSchema as the source of truth.
+      processedArgs = this.coerceStringifiedJsonParams(name, processedArgs);
+
       try {
         logger.debug(`Executing tool: ${name}`, { args: processedArgs });
         const startTime = Date.now();
@@ -533,7 +808,7 @@ export class N8NDocumentationMCPServer {
         if (name.startsWith('validate_') && structuredContent !== null) {
           mcpResponse.structuredContent = structuredContent;
         }
-        
+
         return mcpResponse;
       } catch (error) {
         logger.error(`Error executing tool ${name}`, error);
@@ -560,7 +835,7 @@ export class N8NDocumentationMCPServer {
 
         // Provide more helpful error messages for common n8n issues
         let helpfulMessage = `Error executing tool ${name}: ${errorMessage}`;
-        
+
         if (errorMessage.includes('required') || errorMessage.includes('missing')) {
           helpfulMessage += '\n\nNote: This error often occurs when the AI agent sends incomplete or incorrectly formatted parameters. Please ensure all required fields are provided with the correct types.';
         } else if (errorMessage.includes('type') || errorMessage.includes('expected')) {
@@ -568,12 +843,20 @@ export class N8NDocumentationMCPServer {
         } else if (errorMessage.includes('Unknown category') || errorMessage.includes('not found')) {
           helpfulMessage += '\n\nNote: The requested resource or category was not found. Please check the available options.';
         }
-        
+
         // For n8n schema errors, add specific guidance
         if (name.startsWith('validate_') && (errorMessage.includes('config') || errorMessage.includes('nodeType'))) {
           helpfulMessage += '\n\nFor validation tools:\n- nodeType should be a string (e.g., "nodes-base.webhook")\n- config should be an object (e.g., {})';
         }
-        
+
+        // Include diagnostic info about received args to help debug client issues
+        try {
+          const argDiag = processedArgs && typeof processedArgs === 'object'
+            ? Object.entries(processedArgs).map(([k, v]) => `${k}: ${typeof v}`).join(', ')
+            : `args type: ${typeof processedArgs}`;
+          helpfulMessage += `\n\n[Diagnostic] Received arg types: {${argDiag}}`;
+        } catch { /* ignore diagnostic errors */ }
+
         return {
           content: [
             {
@@ -584,6 +867,46 @@ export class N8NDocumentationMCPServer {
           isError: true,
         };
       }
+    });
+
+    // Handle ListResources for UI apps
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
+      const apps = UIAppRegistry.getAllApps();
+      return {
+        resources: apps
+          .filter(app => app.html !== null)
+          .map(app => ({
+            uri: app.config.uri,
+            name: app.config.displayName,
+            description: app.config.description,
+            mimeType: app.config.mimeType,
+          })),
+      };
+    });
+
+    // Handle ReadResource for UI apps
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const uri = request.params.uri;
+      // Parse ui://n8n-mcp/{id} pattern
+      const match = uri.match(/^ui:\/\/n8n-mcp\/(.+)$/);
+      if (!match) {
+        throw new Error(`Unknown resource URI: ${uri}`);
+      }
+
+      const app = UIAppRegistry.getAppById(match[1]);
+      if (!app || !app.html) {
+        throw new Error(`UI app not found or not built: ${match[1]}`);
+      }
+
+      return {
+        contents: [
+          {
+            uri: app.config.uri,
+            mimeType: app.config.mimeType,
+            text: app.html,
+          },
+        ],
+      };
     });
   }
 
@@ -680,37 +1003,37 @@ export class N8NDocumentationMCPServer {
       let validationResult;
       
       switch (toolName) {
-        case 'validate_node_operation':
+        case 'validate_node':
+          // Consolidated tool handles both modes - validate as operation for now
           validationResult = ToolValidation.validateNodeOperation(args);
           break;
-        case 'validate_node_minimal':
-          validationResult = ToolValidation.validateNodeMinimal(args);
-          break;
         case 'validate_workflow':
-        case 'validate_workflow_connections':
-        case 'validate_workflow_expressions':
           validationResult = ToolValidation.validateWorkflow(args);
           break;
       case 'search_nodes':
         validationResult = ToolValidation.validateSearchNodes(args);
         break;
-      case 'list_node_templates':
-        validationResult = ToolValidation.validateListNodeTemplates(args);
-        break;
       case 'n8n_create_workflow':
         validationResult = ToolValidation.validateCreateWorkflow(args);
         break;
       case 'n8n_get_workflow':
-      case 'n8n_get_workflow_details':
-      case 'n8n_get_workflow_structure':
-      case 'n8n_get_workflow_minimal':
       case 'n8n_update_full_workflow':
       case 'n8n_delete_workflow':
       case 'n8n_validate_workflow':
       case 'n8n_autofix_workflow':
-      case 'n8n_get_execution':
-      case 'n8n_delete_execution':
         validationResult = ToolValidation.validateWorkflowId(args);
+        break;
+      case 'n8n_executions':
+        // Requires action parameter, id validation done in handler based on action
+        validationResult = args.action
+          ? { valid: true, errors: [] }
+          : { valid: false, errors: [{ field: 'action', message: 'action is required' }] };
+        break;
+      case 'n8n_deploy_template':
+        // Requires templateId parameter
+        validationResult = args.templateId !== undefined
+          ? { valid: true, errors: [] }
+          : { valid: false, errors: [{ field: 'templateId', message: 'templateId is required' }] };
         break;
       default:
         // For tools not yet migrated to schema validation, use basic validation
@@ -837,61 +1160,185 @@ export class N8NDocumentationMCPServer {
     return true;
   }
 
+  /**
+   * Coerce mistyped parameters back to their expected types.
+   * Workaround for Claude Desktop / Claude.ai MCP client bugs that serialize
+   * parameters incorrectly (objects as strings, numbers as strings, etc.).
+   *
+   * Handles ALL type mismatches based on the tool's inputSchema:
+   *   string→object, string→array   : JSON.parse
+   *   string→number, string→integer : Number()
+   *   string→boolean                : "true"/"false" parsing
+   *   number→string, boolean→string : .toString()
+   */
+  private coerceStringifiedJsonParams(
+    toolName: string,
+    args: Record<string, any> | undefined
+  ): Record<string, any> | undefined {
+    if (!args || typeof args !== 'object') return args;
+
+    const allTools = [...n8nDocumentationToolsFinal, ...n8nManagementTools];
+    const tool = allTools.find(t => t.name === toolName);
+    if (!tool?.inputSchema?.properties) return args;
+
+    const properties = tool.inputSchema.properties;
+    const coerced = { ...args };
+    let coercedAny = false;
+
+    for (const [key, value] of Object.entries(coerced)) {
+      if (value === undefined || value === null) continue;
+
+      const propSchema = (properties as any)[key];
+      if (!propSchema) continue;
+      const expectedType = propSchema.type;
+      if (!expectedType) continue;
+
+      const actualType = typeof value;
+
+      // Already correct type — skip
+      if (expectedType === 'string' && actualType === 'string') continue;
+      if ((expectedType === 'number' || expectedType === 'integer') && actualType === 'number') continue;
+      if (expectedType === 'boolean' && actualType === 'boolean') continue;
+      if (expectedType === 'object' && actualType === 'object' && !Array.isArray(value)) continue;
+      if (expectedType === 'array' && Array.isArray(value)) continue;
+
+      // --- Coercion: string value → expected type ---
+      if (actualType === 'string') {
+        const trimmed = (value as string).trim();
+
+        if (expectedType === 'object' && trimmed.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+              coerced[key] = parsed;
+              coercedAny = true;
+            }
+          } catch { /* keep original */ }
+          continue;
+        }
+
+        if (expectedType === 'array' && trimmed.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (Array.isArray(parsed)) {
+              coerced[key] = parsed;
+              coercedAny = true;
+            }
+          } catch { /* keep original */ }
+          continue;
+        }
+
+        if (expectedType === 'number' || expectedType === 'integer') {
+          const num = Number(trimmed);
+          if (!isNaN(num) && trimmed !== '') {
+            coerced[key] = expectedType === 'integer' ? Math.trunc(num) : num;
+            coercedAny = true;
+          }
+          continue;
+        }
+
+        if (expectedType === 'boolean') {
+          if (trimmed === 'true') { coerced[key] = true; coercedAny = true; }
+          else if (trimmed === 'false') { coerced[key] = false; coercedAny = true; }
+          continue;
+        }
+      }
+
+      // --- Coercion: number/boolean value → expected string ---
+      if (expectedType === 'string' && (actualType === 'number' || actualType === 'boolean')) {
+        coerced[key] = String(value);
+        coercedAny = true;
+        continue;
+      }
+    }
+
+    if (coercedAny) {
+      logger.warn(`Coerced mistyped params for tool "${toolName}"`, {
+        original: Object.fromEntries(
+          Object.entries(args).map(([k, v]) => [k, `${typeof v}: ${typeof v === 'string' ? v.substring(0, 80) : v}`])
+        ),
+      });
+    }
+
+    return coerced;
+  }
+
   async executeTool(name: string, args: any): Promise<any> {
     // Ensure args is an object and validate it
     args = args || {};
-    
+
+    // Defense in depth: This should never be reached since CallToolRequestSchema
+    // handler already checks disabled tools (line 514-528), but we guard here
+    // in case of future refactoring or direct executeTool() calls
+    const disabledTools = this.getDisabledTools();
+    if (disabledTools.has(name)) {
+      throw new Error(`Tool '${name}' is disabled via DISABLED_TOOLS environment variable`);
+    }
+
     // Log the tool call for debugging n8n issues
-    logger.info(`Tool execution: ${name}`, { 
+    logger.info(`Tool execution: ${name}`, {
       args: typeof args === 'object' ? JSON.stringify(args) : args,
       argsType: typeof args,
       argsKeys: typeof args === 'object' ? Object.keys(args) : 'not-object'
     });
-    
+
     // Validate that args is actually an object
     if (typeof args !== 'object' || args === null) {
       throw new Error(`Invalid arguments for tool ${name}: expected object, got ${typeof args}`);
     }
-    
+
     switch (name) {
       case 'tools_documentation':
         // No required parameters
         return this.getToolsDocumentation(args.topic, args.depth);
-      case 'list_nodes':
-        // No required parameters
-        return this.listNodes(args);
-      case 'get_node_info':
-        this.validateToolParams(name, args, ['nodeType']);
-        return this.getNodeInfo(args.nodeType);
       case 'search_nodes':
         this.validateToolParams(name, args, ['query']);
         // Convert limit to number if provided, otherwise use default
         const limit = args.limit !== undefined ? Number(args.limit) || 20 : 20;
-        return this.searchNodes(args.query, limit, { mode: args.mode, includeExamples: args.includeExamples });
-      case 'list_ai_tools':
-        // No required parameters
-        return this.listAITools();
-      case 'get_node_documentation':
+        return this.searchNodes(args.query, limit, {
+          mode: args.mode,
+          includeExamples: args.includeExamples,
+          source: args.source
+        });
+      case 'get_node':
         this.validateToolParams(name, args, ['nodeType']);
-        return this.getNodeDocumentation(args.nodeType);
-      case 'get_database_statistics':
-        // No required parameters
-        return this.getDatabaseStatistics();
-      case 'get_node_essentials':
-        this.validateToolParams(name, args, ['nodeType']);
-        return this.getNodeEssentials(args.nodeType, args.includeExamples);
-      case 'search_node_properties':
-        this.validateToolParams(name, args, ['nodeType', 'query']);
-        const maxResults = args.maxResults !== undefined ? Number(args.maxResults) || 20 : 20;
-        return this.searchNodeProperties(args.nodeType, args.query, maxResults);
-      case 'list_tasks':
-        // No required parameters
-        return this.listTasks(args.category);
-      case 'validate_node_operation':
+        // Handle consolidated modes: docs, search_properties
+        if (args.mode === 'docs') {
+          return this.getNodeDocumentation(args.nodeType);
+        }
+        if (args.mode === 'search_properties') {
+          if (!args.propertyQuery) {
+            throw new Error('propertyQuery is required for mode=search_properties');
+          }
+          const maxResults = args.maxPropertyResults !== undefined ? Number(args.maxPropertyResults) || 20 : 20;
+          return this.searchNodeProperties(args.nodeType, args.propertyQuery, maxResults);
+        }
+        return this.getNode(
+          args.nodeType,
+          args.detail,
+          args.mode,
+          args.includeTypeInfo,
+          args.includeExamples,
+          args.fromVersion,
+          args.toVersion
+        );
+      case 'validate_node':
         this.validateToolParams(name, args, ['nodeType', 'config']);
         // Ensure config is an object
         if (typeof args.config !== 'object' || args.config === null) {
-          logger.warn(`validate_node_operation called with invalid config type: ${typeof args.config}`);
+          logger.warn(`validate_node called with invalid config type: ${typeof args.config}`);
+          const validationMode = args.mode || 'full';
+          if (validationMode === 'minimal') {
+            return {
+              nodeType: args.nodeType || 'unknown',
+              displayName: 'Unknown Node',
+              valid: false,
+              missingRequiredFields: [
+                'Invalid config format - expected object',
+                '🔧 RECOVERY: Use format { "resource": "...", "operation": "..." } or {} for empty config'
+              ]
+            };
+          }
           return {
             nodeType: args.nodeType || 'unknown',
             workflowNodeType: args.nodeType || 'unknown',
@@ -907,7 +1354,7 @@ export class N8NDocumentationMCPServer {
             suggestions: [
               '🔧 RECOVERY: Invalid config detected. Fix with:',
               '   • Ensure config is an object: { "resource": "...", "operation": "..." }',
-              '   • Use get_node_essentials to see required fields for this node type',
+              '   • Use get_node to see required fields for this node type',
               '   • Check if the node type is correct before configuring it'
             ],
             summary: {
@@ -918,95 +1365,75 @@ export class N8NDocumentationMCPServer {
             }
           };
         }
-        return this.validateNodeConfig(args.nodeType, args.config, 'operation', args.profile);
-      case 'validate_node_minimal':
-        this.validateToolParams(name, args, ['nodeType', 'config']);
-        // Ensure config is an object
-        if (typeof args.config !== 'object' || args.config === null) {
-          logger.warn(`validate_node_minimal called with invalid config type: ${typeof args.config}`);
-          return {
-            nodeType: args.nodeType || 'unknown',
-            displayName: 'Unknown Node',
-            valid: false,
-            missingRequiredFields: [
-              'Invalid config format - expected object',
-              '🔧 RECOVERY: Use format { "resource": "...", "operation": "..." } or {} for empty config'
-            ]
-          };
+        // Handle mode parameter
+        const validationMode = args.mode || 'full';
+        if (validationMode === 'minimal') {
+          return this.validateNodeMinimal(args.nodeType, args.config);
         }
-        return this.validateNodeMinimal(args.nodeType, args.config);
-      case 'get_property_dependencies':
-        this.validateToolParams(name, args, ['nodeType']);
-        return this.getPropertyDependencies(args.nodeType, args.config);
-      case 'get_node_as_tool_info':
-        this.validateToolParams(name, args, ['nodeType']);
-        return this.getNodeAsToolInfo(args.nodeType);
-      case 'list_templates':
-        // No required params
-        const listLimit = Math.min(Math.max(Number(args.limit) || 10, 1), 100);
-        const listOffset = Math.max(Number(args.offset) || 0, 0);
-        const sortBy = args.sortBy || 'views';
-        const includeMetadata = Boolean(args.includeMetadata);
-        return this.listTemplates(listLimit, listOffset, sortBy, includeMetadata);
-      case 'list_node_templates':
-        this.validateToolParams(name, args, ['nodeTypes']);
-        const templateLimit = Math.min(Math.max(Number(args.limit) || 10, 1), 100);
-        const templateOffset = Math.max(Number(args.offset) || 0, 0);
-        return this.listNodeTemplates(args.nodeTypes, templateLimit, templateOffset);
+        return this.validateNodeConfig(args.nodeType, args.config, 'operation', args.profile);
       case 'get_template':
         this.validateToolParams(name, args, ['templateId']);
         const templateId = Number(args.templateId);
-        const mode = args.mode || 'full';
-        return this.getTemplate(templateId, mode);
-      case 'search_templates':
-        this.validateToolParams(name, args, ['query']);
+        const templateMode = args.mode || 'full';
+        return this.getTemplate(templateId, templateMode);
+      case 'search_templates': {
+        // Consolidated tool with searchMode parameter
+        const searchMode = args.searchMode || 'keyword';
         const searchLimit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
         const searchOffset = Math.max(Number(args.offset) || 0, 0);
-        const searchFields = args.fields as string[] | undefined;
-        return this.searchTemplates(args.query, searchLimit, searchOffset, searchFields);
-      case 'get_templates_for_task':
-        this.validateToolParams(name, args, ['task']);
-        const taskLimit = Math.min(Math.max(Number(args.limit) || 10, 1), 100);
-        const taskOffset = Math.max(Number(args.offset) || 0, 0);
-        return this.getTemplatesForTask(args.task, taskLimit, taskOffset);
-      case 'search_templates_by_metadata':
-        // No required params - all filters are optional
-        const metadataLimit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
-        const metadataOffset = Math.max(Number(args.offset) || 0, 0);
-        return this.searchTemplatesByMetadata({
-          category: args.category,
-          complexity: args.complexity,
-          maxSetupMinutes: args.maxSetupMinutes ? Number(args.maxSetupMinutes) : undefined,
-          minSetupMinutes: args.minSetupMinutes ? Number(args.minSetupMinutes) : undefined,
-          requiredService: args.requiredService,
-          targetAudience: args.targetAudience
-        }, metadataLimit, metadataOffset);
+
+        switch (searchMode) {
+          case 'by_nodes':
+            if (!args.nodeTypes || !Array.isArray(args.nodeTypes) || args.nodeTypes.length === 0) {
+              throw new Error('nodeTypes array is required for searchMode=by_nodes');
+            }
+            return this.listNodeTemplates(args.nodeTypes, searchLimit, searchOffset);
+          case 'by_task':
+            if (!args.task) {
+              throw new Error('task is required for searchMode=by_task');
+            }
+            return this.getTemplatesForTask(args.task, searchLimit, searchOffset);
+          case 'by_metadata':
+            return this.searchTemplatesByMetadata({
+              category: args.category,
+              complexity: args.complexity,
+              maxSetupMinutes: args.maxSetupMinutes ? Number(args.maxSetupMinutes) : undefined,
+              minSetupMinutes: args.minSetupMinutes ? Number(args.minSetupMinutes) : undefined,
+              requiredService: args.requiredService,
+              targetAudience: args.targetAudience
+            }, searchLimit, searchOffset);
+          case 'keyword':
+          default:
+            if (!args.query) {
+              throw new Error('query is required for searchMode=keyword');
+            }
+            const searchFields = args.fields as string[] | undefined;
+            return this.searchTemplates(args.query, searchLimit, searchOffset, searchFields);
+        }
+      }
       case 'validate_workflow':
         this.validateToolParams(name, args, ['workflow']);
         return this.validateWorkflow(args.workflow, args.options);
-      case 'validate_workflow_connections':
-        this.validateToolParams(name, args, ['workflow']);
-        return this.validateWorkflowConnections(args.workflow);
-      case 'validate_workflow_expressions':
-        this.validateToolParams(name, args, ['workflow']);
-        return this.validateWorkflowExpressions(args.workflow);
-      
+
       // n8n Management Tools (if API is configured)
       case 'n8n_create_workflow':
         this.validateToolParams(name, args, ['name', 'nodes', 'connections']);
         return n8nHandlers.handleCreateWorkflow(args, this.instanceContext);
-      case 'n8n_get_workflow':
+      case 'n8n_get_workflow': {
         this.validateToolParams(name, args, ['id']);
-        return n8nHandlers.handleGetWorkflow(args, this.instanceContext);
-      case 'n8n_get_workflow_details':
-        this.validateToolParams(name, args, ['id']);
-        return n8nHandlers.handleGetWorkflowDetails(args, this.instanceContext);
-      case 'n8n_get_workflow_structure':
-        this.validateToolParams(name, args, ['id']);
-        return n8nHandlers.handleGetWorkflowStructure(args, this.instanceContext);
-      case 'n8n_get_workflow_minimal':
-        this.validateToolParams(name, args, ['id']);
-        return n8nHandlers.handleGetWorkflowMinimal(args, this.instanceContext);
+        const workflowMode = args.mode || 'full';
+        switch (workflowMode) {
+          case 'details':
+            return n8nHandlers.handleGetWorkflowDetails(args, this.instanceContext);
+          case 'structure':
+            return n8nHandlers.handleGetWorkflowStructure(args, this.instanceContext);
+          case 'minimal':
+            return n8nHandlers.handleGetWorkflowMinimal(args, this.instanceContext);
+          case 'full':
+          default:
+            return n8nHandlers.handleGetWorkflow(args, this.instanceContext);
+        }
+      }
       case 'n8n_update_full_workflow':
         this.validateToolParams(name, args, ['id']);
         return n8nHandlers.handleUpdateWorkflow(args, this.repository!, this.instanceContext);
@@ -1029,30 +1456,45 @@ export class N8NDocumentationMCPServer {
         await this.ensureInitialized();
         if (!this.repository) throw new Error('Repository not initialized');
         return n8nHandlers.handleAutofixWorkflow(args, this.repository, this.instanceContext);
-      case 'n8n_trigger_webhook_workflow':
-        this.validateToolParams(name, args, ['webhookUrl']);
-        return n8nHandlers.handleTriggerWebhookWorkflow(args, this.instanceContext);
-      case 'n8n_get_execution':
-        this.validateToolParams(name, args, ['id']);
-        return n8nHandlers.handleGetExecution(args, this.instanceContext);
-      case 'n8n_list_executions':
-        // No required parameters
-        return n8nHandlers.handleListExecutions(args, this.instanceContext);
-      case 'n8n_delete_execution':
-        this.validateToolParams(name, args, ['id']);
-        return n8nHandlers.handleDeleteExecution(args, this.instanceContext);
+      case 'n8n_test_workflow':
+        this.validateToolParams(name, args, ['workflowId']);
+        return n8nHandlers.handleTestWorkflow(args, this.instanceContext);
+      case 'n8n_executions': {
+        this.validateToolParams(name, args, ['action']);
+        const execAction = args.action;
+        switch (execAction) {
+          case 'get':
+            if (!args.id) {
+              throw new Error('id is required for action=get');
+            }
+            return n8nHandlers.handleGetExecution(args, this.instanceContext);
+          case 'list':
+            return n8nHandlers.handleListExecutions(args, this.instanceContext);
+          case 'delete':
+            if (!args.id) {
+              throw new Error('id is required for action=delete');
+            }
+            return n8nHandlers.handleDeleteExecution(args, this.instanceContext);
+          default:
+            throw new Error(`Unknown action: ${execAction}. Valid actions: get, list, delete`);
+        }
+      }
       case 'n8n_health_check':
-        // No required parameters
+        // No required parameters - supports mode='status' (default) or mode='diagnostic'
+        if (args.mode === 'diagnostic') {
+          return n8nHandlers.handleDiagnostic({ params: { arguments: args } }, this.instanceContext);
+        }
         return n8nHandlers.handleHealthCheck(this.instanceContext);
-      case 'n8n_list_available_tools':
-        // No required parameters
-        return n8nHandlers.handleListAvailableTools(this.instanceContext);
-      case 'n8n_diagnostic':
-        // No required parameters
-        return n8nHandlers.handleDiagnostic({ params: { arguments: args } }, this.instanceContext);
       case 'n8n_workflow_versions':
         this.validateToolParams(name, args, ['mode']);
         return n8nHandlers.handleWorkflowVersions(args, this.repository!, this.instanceContext);
+
+      case 'n8n_deploy_template':
+        this.validateToolParams(name, args, ['templateId']);
+        await this.ensureInitialized();
+        if (!this.templateService) throw new Error('Template service not initialized');
+        if (!this.repository) throw new Error('Repository not initialized');
+        return n8nHandlers.handleDeployTemplate(args, this.templateService, this.repository, this.instanceContext);
 
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -1175,12 +1617,20 @@ export class N8NDocumentationMCPServer {
       });
     }
 
-    return {
+    const result: any = {
       ...node,
       workflowNodeType: getWorkflowNodeType(node.package ?? 'n8n-nodes-base', node.nodeType),
       aiToolCapabilities,
       outputs
     };
+
+    // Add tool variant guidance if applicable
+    const toolVariantInfo = this.buildToolVariantGuidance(node);
+    if (toolVariantInfo) {
+      result.toolVariantInfo = toolVariantInfo;
+    }
+
+    return result;
   }
 
   /**
@@ -1199,6 +1649,7 @@ export class N8NDocumentationMCPServer {
       mode?: 'OR' | 'AND' | 'FUZZY';
       includeSource?: boolean;
       includeExamples?: boolean;
+      source?: 'all' | 'core' | 'community' | 'verified';
     }
   ): Promise<any> {
     await this.ensureInitialized();
@@ -1237,7 +1688,11 @@ export class N8NDocumentationMCPServer {
     query: string,
     limit: number,
     mode: 'OR' | 'AND' | 'FUZZY',
-    options?: { includeSource?: boolean; includeExamples?: boolean; }
+    options?: {
+      includeSource?: boolean;
+      includeExamples?: boolean;
+      source?: 'all' | 'core' | 'community' | 'verified';
+    }
   ): Promise<any> {
     if (!this.db) throw new Error('Database not initialized');
 
@@ -1277,6 +1732,22 @@ export class N8NDocumentationMCPServer {
     }
     
     try {
+      // Build source filter SQL
+      let sourceFilter = '';
+      const sourceValue = options?.source || 'all';
+      switch (sourceValue) {
+        case 'core':
+          sourceFilter = 'AND n.is_community = 0';
+          break;
+        case 'community':
+          sourceFilter = 'AND n.is_community = 1';
+          break;
+        case 'verified':
+          sourceFilter = 'AND n.is_community = 1 AND n.is_verified = 1';
+          break;
+        // 'all' - no filter
+      }
+
       // Use FTS5 with ranking
       const nodes = this.db.prepare(`
         SELECT
@@ -1285,6 +1756,7 @@ export class N8NDocumentationMCPServer {
         FROM nodes n
         JOIN nodes_fts ON n.rowid = nodes_fts.rowid
         WHERE nodes_fts MATCH ?
+        ${sourceFilter}
         ORDER BY
           CASE
             WHEN LOWER(n.display_name) = LOWER(?) THEN 0
@@ -1328,15 +1800,31 @@ export class N8NDocumentationMCPServer {
       
       const result: any = {
         query,
-        results: scoredNodes.map(node => ({
-          nodeType: node.node_type,
-          workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
-          displayName: node.display_name,
-          description: node.description,
-          category: node.category,
-          package: node.package_name,
-          relevance: this.calculateRelevance(node, cleanedQuery)
-        })),
+        results: scoredNodes.map(node => {
+          const nodeResult: any = {
+            nodeType: node.node_type,
+            workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
+            displayName: node.display_name,
+            description: node.description,
+            category: node.category,
+            package: node.package_name,
+            relevance: this.calculateRelevance(node, cleanedQuery)
+          };
+
+          // Add community metadata if this is a community node
+          if ((node as any).is_community === 1) {
+            nodeResult.isCommunity = true;
+            nodeResult.isVerified = (node as any).is_verified === 1;
+            if ((node as any).author_name) {
+              nodeResult.authorName = (node as any).author_name;
+            }
+            if ((node as any).npm_downloads) {
+              nodeResult.npmDownloads = (node as any).npm_downloads;
+            }
+          }
+
+          return nodeResult;
+        }),
         totalCount: scoredNodes.length
       };
 
@@ -1552,9 +2040,29 @@ export class N8NDocumentationMCPServer {
   private async searchNodesLIKE(
     query: string,
     limit: number,
-    options?: { includeSource?: boolean; includeExamples?: boolean; }
+    options?: {
+      includeSource?: boolean;
+      includeExamples?: boolean;
+      source?: 'all' | 'core' | 'community' | 'verified';
+    }
   ): Promise<any> {
     if (!this.db) throw new Error('Database not initialized');
+
+    // Build source filter SQL
+    let sourceFilter = '';
+    const sourceValue = options?.source || 'all';
+    switch (sourceValue) {
+      case 'core':
+        sourceFilter = 'AND is_community = 0';
+        break;
+      case 'community':
+        sourceFilter = 'AND is_community = 1';
+        break;
+      case 'verified':
+        sourceFilter = 'AND is_community = 1 AND is_verified = 1';
+        break;
+      // 'all' - no filter
+    }
 
     // This is the existing LIKE-based implementation
     // Handle exact phrase searches with quotes
@@ -1562,7 +2070,8 @@ export class N8NDocumentationMCPServer {
       const exactPhrase = query.slice(1, -1);
       const nodes = this.db!.prepare(`
         SELECT * FROM nodes
-        WHERE node_type LIKE ? OR display_name LIKE ? OR description LIKE ?
+        WHERE (node_type LIKE ? OR display_name LIKE ? OR description LIKE ?)
+        ${sourceFilter}
         LIMIT ?
       `).all(`%${exactPhrase}%`, `%${exactPhrase}%`, `%${exactPhrase}%`, limit * 3) as NodeRow[];
 
@@ -1571,14 +2080,30 @@ export class N8NDocumentationMCPServer {
 
       const result: any = {
         query,
-        results: rankedNodes.map(node => ({
-          nodeType: node.node_type,
-          workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
-          displayName: node.display_name,
-          description: node.description,
-          category: node.category,
-          package: node.package_name
-        })),
+        results: rankedNodes.map(node => {
+          const nodeResult: any = {
+            nodeType: node.node_type,
+            workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
+            displayName: node.display_name,
+            description: node.description,
+            category: node.category,
+            package: node.package_name
+          };
+
+          // Add community metadata if this is a community node
+          if ((node as any).is_community === 1) {
+            nodeResult.isCommunity = true;
+            nodeResult.isVerified = (node as any).is_verified === 1;
+            if ((node as any).author_name) {
+              nodeResult.authorName = (node as any).author_name;
+            }
+            if ((node as any).npm_downloads) {
+              nodeResult.npmDownloads = (node as any).npm_downloads;
+            }
+          }
+
+          return nodeResult;
+        }),
         totalCount: rankedNodes.length
       };
 
@@ -1630,8 +2155,9 @@ export class N8NDocumentationMCPServer {
     params.push(limit * 3);
     
     const nodes = this.db!.prepare(`
-      SELECT DISTINCT * FROM nodes 
-      WHERE ${conditions}
+      SELECT DISTINCT * FROM nodes
+      WHERE (${conditions})
+      ${sourceFilter}
       LIMIT ?
     `).all(...params) as NodeRow[];
     
@@ -1640,14 +2166,30 @@ export class N8NDocumentationMCPServer {
 
     const result: any = {
       query,
-      results: rankedNodes.map(node => ({
-        nodeType: node.node_type,
-        workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
-        displayName: node.display_name,
-        description: node.description,
-        category: node.category,
-        package: node.package_name
-      })),
+      results: rankedNodes.map(node => {
+        const nodeResult: any = {
+          nodeType: node.node_type,
+          workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
+          displayName: node.display_name,
+          description: node.description,
+          category: node.category,
+          package: node.package_name
+        };
+
+        // Add community metadata if this is a community node
+        if ((node as any).is_community === 1) {
+          nodeResult.isCommunity = true;
+          nodeResult.isVerified = (node as any).is_verified === 1;
+          if ((node as any).author_name) {
+            nodeResult.authorName = (node as any).author_name;
+          }
+          if ((node as any).npm_downloads) {
+            nodeResult.npmDownloads = (node as any).npm_downloads;
+          }
+        }
+
+        return nodeResult;
+      }),
       totalCount: rankedNodes.length
     };
 
@@ -1872,31 +2414,34 @@ export class N8NDocumentationMCPServer {
     // First try with normalized type
     const normalizedType = NodeTypeNormalizer.normalizeToFullForm(nodeType);
     let node = this.db!.prepare(`
-      SELECT node_type, display_name, documentation, description 
-      FROM nodes 
+      SELECT node_type, display_name, documentation, description,
+             ai_documentation_summary, ai_summary_generated_at
+      FROM nodes
       WHERE node_type = ?
     `).get(normalizedType) as NodeRow | undefined;
-    
+
     // If not found and normalization changed the type, try original
     if (!node && normalizedType !== nodeType) {
       node = this.db!.prepare(`
-        SELECT node_type, display_name, documentation, description 
-        FROM nodes 
+        SELECT node_type, display_name, documentation, description,
+               ai_documentation_summary, ai_summary_generated_at
+        FROM nodes
         WHERE node_type = ?
       `).get(nodeType) as NodeRow | undefined;
     }
-    
+
     // If still not found, try alternatives
     if (!node) {
       const alternatives = getNodeTypeAlternatives(normalizedType);
-      
+
       for (const alt of alternatives) {
         node = this.db!.prepare(`
-          SELECT node_type, display_name, documentation, description 
-          FROM nodes 
+          SELECT node_type, display_name, documentation, description,
+                 ai_documentation_summary, ai_summary_generated_at
+          FROM nodes
           WHERE node_type = ?
         `).get(alt) as NodeRow | undefined;
-        
+
         if (node) break;
       }
     }
@@ -1905,6 +2450,11 @@ export class N8NDocumentationMCPServer {
       throw new Error(`Node ${nodeType} not found`);
     }
     
+    // Parse AI documentation summary if present
+    const aiDocSummary = node.ai_documentation_summary
+      ? this.safeJsonParse(node.ai_documentation_summary, null)
+      : null;
+
     // If no documentation, generate fallback with null safety
     if (!node.documentation) {
       const essentials = await this.getNodeEssentials(nodeType);
@@ -1928,7 +2478,9 @@ ${essentials?.commonProperties?.length > 0 ?
 ## Note
 Full documentation is being prepared. For now, use get_node_essentials for configuration help.
 `,
-        hasDocumentation: false
+        hasDocumentation: false,
+        aiDocumentationSummary: aiDocSummary,
+        aiSummaryGeneratedAt: node.ai_summary_generated_at || null,
       };
     }
 
@@ -1937,7 +2489,17 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
       displayName: node.display_name || 'Unknown Node',
       documentation: node.documentation,
       hasDocumentation: true,
+      aiDocumentationSummary: aiDocSummary,
+      aiSummaryGeneratedAt: node.ai_summary_generated_at || null,
     };
+  }
+
+  private safeJsonParse(json: string, defaultValue: any = null): any {
+    try {
+      return JSON.parse(json);
+    } catch {
+      return defaultValue;
+    }
   }
 
   private async getDatabaseStatistics(): Promise<any> {
@@ -2041,14 +2603,19 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
     // Get operations (already parsed by repository)
     const operations = node.operations || [];
     
-    const result = {
+    // Get the latest version - this is important for AI to use correct typeVersion
+    const latestVersion = node.version ?? '1';
+
+    const result: any = {
       nodeType: node.nodeType,
       workflowNodeType: getWorkflowNodeType(node.package ?? 'n8n-nodes-base', node.nodeType),
       displayName: node.displayName,
       description: node.description,
       category: node.category,
-      version: node.version ?? '1',
+      version: latestVersion,
       isVersioned: node.isVersioned ?? false,
+      // Prominent warning to use the correct typeVersion
+      versionNotice: `⚠️ Use typeVersion: ${latestVersion} when creating this node`,
       requiredProperties: essentials.required,
       commonProperties: essentials.common,
       operations: operations.map((op: any) => ({
@@ -2068,6 +2635,12 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
         developmentStyle: node.developmentStyle ?? 'programmatic'
       }
     };
+
+    // Add tool variant guidance if applicable
+    const toolVariantInfo = this.buildToolVariantGuidance(node);
+    if (toolVariantInfo) {
+      result.toolVariantInfo = toolVariantInfo;
+    }
 
     // Add examples from templates if requested
     if (includeExamples) {
@@ -2120,6 +2693,401 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
     this.cache.set(cacheKey, result, 3600);
 
     return result;
+  }
+
+  /**
+   * Unified node information retrieval with multiple detail levels and modes.
+   *
+   * @param nodeType - Full node type identifier (e.g., "nodes-base.httpRequest" or "nodes-langchain.agent")
+   * @param detail - Information detail level (minimal, standard, full). Only applies when mode='info'.
+   *   - minimal: ~200 tokens, basic metadata only (no version info)
+   *   - standard: ~1-2K tokens, essential properties and operations (includes version info, AI-friendly default)
+   *   - full: ~3-8K tokens, complete node information with all properties (includes version info)
+   * @param mode - Operation mode determining the type of information returned:
+   *   - info: Node configuration details (respects detail level)
+   *   - versions: Complete version history with breaking changes summary
+   *   - compare: Property-level comparison between two versions (requires fromVersion)
+   *   - breaking: Breaking changes only between versions (requires fromVersion)
+   *   - migrations: Auto-migratable changes between versions (requires both fromVersion and toVersion)
+   * @param includeTypeInfo - Include type structure metadata for properties (only applies to mode='info').
+   *   Adds ~80-120 tokens per property with type category, JS type, and validation rules.
+   * @param includeExamples - Include real-world configuration examples from templates (only applies to mode='info' with detail='standard').
+   *   Adds ~200-400 tokens per example.
+   * @param fromVersion - Source version for comparison modes (required for compare, breaking, migrations).
+   *   Format: "1.0" or "2.1"
+   * @param toVersion - Target version for comparison modes (optional for compare/breaking, required for migrations).
+   *   Defaults to latest version if omitted.
+   * @returns NodeInfoResponse - Union type containing different response structures based on mode and detail parameters
+   */
+  private async getNode(
+    nodeType: string,
+    detail: string = 'standard',
+    mode: string = 'info',
+    includeTypeInfo?: boolean,
+    includeExamples?: boolean,
+    fromVersion?: string,
+    toVersion?: string
+  ): Promise<NodeInfoResponse> {
+    await this.ensureInitialized();
+    if (!this.repository) throw new Error('Repository not initialized');
+
+    // Validate parameters
+    const validDetailLevels = ['minimal', 'standard', 'full'];
+    const validModes = ['info', 'versions', 'compare', 'breaking', 'migrations'];
+
+    if (!validDetailLevels.includes(detail)) {
+      throw new Error(`get_node: Invalid detail level "${detail}". Valid options: ${validDetailLevels.join(', ')}`);
+    }
+
+    if (!validModes.includes(mode)) {
+      throw new Error(`get_node: Invalid mode "${mode}". Valid options: ${validModes.join(', ')}`);
+    }
+
+    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(nodeType);
+
+    // Version modes - detail level ignored
+    if (mode !== 'info') {
+      return this.handleVersionMode(
+        normalizedType,
+        mode,
+        fromVersion,
+        toVersion
+      );
+    }
+
+    // Info mode - respect detail level
+    return this.handleInfoMode(
+      normalizedType,
+      detail,
+      includeTypeInfo,
+      includeExamples
+    );
+  }
+
+  /**
+   * Handle info mode - returns node information at specified detail level
+   */
+  private async handleInfoMode(
+    nodeType: string,
+    detail: string,
+    includeTypeInfo?: boolean,
+    includeExamples?: boolean
+  ): Promise<NodeMinimalInfo | NodeStandardInfo | NodeFullInfo> {
+    switch (detail) {
+      case 'minimal': {
+        // Get basic node metadata only (no version info for minimal mode)
+        let node = this.repository!.getNode(nodeType);
+
+        if (!node) {
+          const alternatives = getNodeTypeAlternatives(nodeType);
+          for (const alt of alternatives) {
+            const found = this.repository!.getNode(alt);
+            if (found) {
+              node = found;
+              break;
+            }
+          }
+        }
+
+        if (!node) {
+          throw new Error(`Node ${nodeType} not found`);
+        }
+
+        const result: NodeMinimalInfo = {
+          nodeType: node.nodeType,
+          workflowNodeType: getWorkflowNodeType(node.package ?? 'n8n-nodes-base', node.nodeType),
+          displayName: node.displayName,
+          description: node.description,
+          category: node.category,
+          package: node.package,
+          isAITool: node.isAITool,
+          isTrigger: node.isTrigger,
+          isWebhook: node.isWebhook
+        };
+
+        // Add tool variant guidance if applicable
+        const toolVariantInfo = this.buildToolVariantGuidance(node);
+        if (toolVariantInfo) {
+          result.toolVariantInfo = toolVariantInfo;
+        }
+
+        return result;
+      }
+
+      case 'standard': {
+        // Use existing getNodeEssentials logic
+        const essentials = await this.getNodeEssentials(nodeType, includeExamples);
+        const versionSummary = this.getVersionSummary(nodeType);
+
+        // Apply type info enrichment if requested
+        if (includeTypeInfo) {
+          essentials.requiredProperties = this.enrichPropertiesWithTypeInfo(essentials.requiredProperties);
+          essentials.commonProperties = this.enrichPropertiesWithTypeInfo(essentials.commonProperties);
+        }
+
+        return {
+          ...essentials,
+          versionInfo: versionSummary
+        };
+      }
+
+      case 'full': {
+        // Use existing getNodeInfo logic
+        const fullInfo = await this.getNodeInfo(nodeType);
+        const versionSummary = this.getVersionSummary(nodeType);
+
+        // Apply type info enrichment if requested
+        if (includeTypeInfo && fullInfo.properties) {
+          fullInfo.properties = this.enrichPropertiesWithTypeInfo(fullInfo.properties);
+        }
+
+        return {
+          ...fullInfo,
+          versionInfo: versionSummary
+        };
+      }
+
+      default:
+        throw new Error(`Unknown detail level: ${detail}`);
+    }
+  }
+
+  /**
+   * Handle version modes - returns version history and comparison data
+   */
+  private async handleVersionMode(
+    nodeType: string,
+    mode: string,
+    fromVersion?: string,
+    toVersion?: string
+  ): Promise<VersionHistoryInfo | VersionComparisonInfo> {
+    switch (mode) {
+      case 'versions':
+        return this.getVersionHistory(nodeType);
+
+      case 'compare':
+        if (!fromVersion) {
+          throw new Error(`get_node: fromVersion is required for compare mode (nodeType: ${nodeType})`);
+        }
+        return this.compareVersions(nodeType, fromVersion, toVersion);
+
+      case 'breaking':
+        if (!fromVersion) {
+          throw new Error(`get_node: fromVersion is required for breaking mode (nodeType: ${nodeType})`);
+        }
+        return this.getBreakingChanges(nodeType, fromVersion, toVersion);
+
+      case 'migrations':
+        if (!fromVersion || !toVersion) {
+          throw new Error(`get_node: Both fromVersion and toVersion are required for migrations mode (nodeType: ${nodeType})`);
+        }
+        return this.getMigrations(nodeType, fromVersion, toVersion);
+
+      default:
+        throw new Error(`get_node: Unknown mode: ${mode} (nodeType: ${nodeType})`);
+    }
+  }
+
+  /**
+   * Get version summary (always included in info mode responses)
+   * Cached for 24 hours to improve performance
+   */
+  private getVersionSummary(nodeType: string): VersionSummary {
+    const cacheKey = `version-summary:${nodeType}`;
+    const cached = this.cache.get(cacheKey) as VersionSummary | null;
+
+    if (cached) {
+      return cached;
+    }
+
+    const versions = this.repository!.getNodeVersions(nodeType);
+    const latest = this.repository!.getLatestNodeVersion(nodeType);
+
+    const summary: VersionSummary = {
+      currentVersion: latest?.version || 'unknown',
+      totalVersions: versions.length,
+      hasVersionHistory: versions.length > 0
+    };
+
+    // Cache for 24 hours (86400000 ms)
+    this.cache.set(cacheKey, summary, 86400000);
+
+    return summary;
+  }
+
+  /**
+   * Get complete version history for a node
+   */
+  private getVersionHistory(nodeType: string): any {
+    const versions = this.repository!.getNodeVersions(nodeType);
+
+    return {
+      nodeType,
+      totalVersions: versions.length,
+      versions: versions.map(v => ({
+        version: v.version,
+        isCurrent: v.isCurrentMax,
+        minimumN8nVersion: v.minimumN8nVersion,
+        releasedAt: v.releasedAt,
+        hasBreakingChanges: (v.breakingChanges || []).length > 0,
+        breakingChangesCount: (v.breakingChanges || []).length,
+        deprecatedProperties: v.deprecatedProperties || [],
+        addedProperties: v.addedProperties || []
+      })),
+      available: versions.length > 0,
+      message: versions.length === 0 ?
+        'No version history available. Version tracking may not be enabled for this node.' :
+        undefined
+    };
+  }
+
+  /**
+   * Compare two versions of a node
+   */
+  private compareVersions(
+    nodeType: string,
+    fromVersion: string,
+    toVersion?: string
+  ): any {
+    const latest = this.repository!.getLatestNodeVersion(nodeType);
+    const targetVersion = toVersion || latest?.version;
+
+    if (!targetVersion) {
+      throw new Error('No target version available');
+    }
+
+    const changes = this.repository!.getPropertyChanges(
+      nodeType,
+      fromVersion,
+      targetVersion
+    );
+
+    return {
+      nodeType,
+      fromVersion,
+      toVersion: targetVersion,
+      totalChanges: changes.length,
+      breakingChanges: changes.filter(c => c.isBreaking).length,
+      changes: changes.map(c => ({
+        property: c.propertyName,
+        changeType: c.changeType,
+        isBreaking: c.isBreaking,
+        severity: c.severity,
+        oldValue: c.oldValue,
+        newValue: c.newValue,
+        migrationHint: c.migrationHint,
+        autoMigratable: c.autoMigratable
+      }))
+    };
+  }
+
+  /**
+   * Get breaking changes between versions
+   */
+  private getBreakingChanges(
+    nodeType: string,
+    fromVersion: string,
+    toVersion?: string
+  ): any {
+    const breakingChanges = this.repository!.getBreakingChanges(
+      nodeType,
+      fromVersion,
+      toVersion
+    );
+
+    return {
+      nodeType,
+      fromVersion,
+      toVersion: toVersion || 'latest',
+      totalBreakingChanges: breakingChanges.length,
+      changes: breakingChanges.map(c => ({
+        fromVersion: c.fromVersion,
+        toVersion: c.toVersion,
+        property: c.propertyName,
+        changeType: c.changeType,
+        severity: c.severity,
+        migrationHint: c.migrationHint,
+        oldValue: c.oldValue,
+        newValue: c.newValue
+      })),
+      upgradeSafe: breakingChanges.length === 0
+    };
+  }
+
+  /**
+   * Get auto-migratable changes between versions
+   */
+  private getMigrations(
+    nodeType: string,
+    fromVersion: string,
+    toVersion: string
+  ): any {
+    const migrations = this.repository!.getAutoMigratableChanges(
+      nodeType,
+      fromVersion,
+      toVersion
+    );
+
+    const allChanges = this.repository!.getPropertyChanges(
+      nodeType,
+      fromVersion,
+      toVersion
+    );
+
+    return {
+      nodeType,
+      fromVersion,
+      toVersion,
+      autoMigratableChanges: migrations.length,
+      totalChanges: allChanges.length,
+      migrations: migrations.map(m => ({
+        property: m.propertyName,
+        changeType: m.changeType,
+        migrationStrategy: m.migrationStrategy,
+        severity: m.severity
+      })),
+      requiresManualMigration: migrations.length < allChanges.length
+    };
+  }
+
+  /**
+   * Enrich property with type structure metadata
+   */
+  private enrichPropertyWithTypeInfo(property: any): any {
+    if (!property || !property.type) return property;
+
+    const structure = TypeStructureService.getStructure(property.type);
+    if (!structure) return property;
+
+    return {
+      ...property,
+      typeInfo: {
+        category: structure.type,
+        jsType: structure.jsType,
+        description: structure.description,
+        isComplex: TypeStructureService.isComplexType(property.type),
+        isPrimitive: TypeStructureService.isPrimitiveType(property.type),
+        allowsExpressions: structure.validation?.allowExpressions ?? true,
+        allowsEmpty: structure.validation?.allowEmpty ?? false,
+        ...(structure.structure && {
+          structureHints: {
+            hasProperties: !!structure.structure.properties,
+            hasItems: !!structure.structure.items,
+            isFlexible: structure.structure.flexible ?? false,
+            requiredFields: structure.structure.required ?? []
+          }
+        }),
+        ...(structure.notes && { notes: structure.notes })
+      }
+    };
+  }
+
+  /**
+   * Enrich an array of properties with type structure metadata
+   */
+  private enrichPropertiesWithTypeInfo(properties: any[]): any[] {
+    if (!properties || !Array.isArray(properties)) return properties;
+    return properties.map((prop: any) => this.enrichPropertyWithTypeInfo(prop));
   }
 
   private async searchNodeProperties(nodeType: string, query: string, maxResults: number = 20): Promise<any> {
@@ -2276,12 +3244,18 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
     
     // Get properties
     const properties = node.properties || [];
-    
+
+    // Add @version to config for displayOptions evaluation (supports _cnd operators)
+    const configWithVersion = {
+      '@version': node.version || 1,
+      ...config
+    };
+
     // Use enhanced validator with operation mode by default
     const validationResult = EnhancedConfigValidator.validateWithMode(
-      node.nodeType, 
-      config, 
-      properties, 
+      node.nodeType,
+      configWithVersion,
+      properties,
       mode,
       profile
     );
@@ -2525,7 +3499,45 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
       'Extend AI agent capabilities'
     ];
   }
-  
+
+  /**
+   * Build tool variant guidance for node responses.
+   * Provides cross-reference information between base nodes and their Tool variants.
+   */
+  private buildToolVariantGuidance(node: any): ToolVariantGuidance | undefined {
+    const isToolVariant = !!node.isToolVariant;
+    const hasToolVariant = !!node.hasToolVariant;
+    const toolVariantOf = node.toolVariantOf;
+
+    // If this is neither a Tool variant nor has one, no guidance needed
+    if (!isToolVariant && !hasToolVariant) {
+      return undefined;
+    }
+
+    if (isToolVariant) {
+      // This IS a Tool variant (e.g., nodes-base.supabaseTool)
+      return {
+        isToolVariant: true,
+        toolVariantOf,
+        hasToolVariant: false,
+        guidance: `This is the Tool variant for AI Agent integration. Use this node type when connecting to AI Agents. The base node is: ${toolVariantOf}`
+      };
+    }
+
+    if (hasToolVariant && node.nodeType) {
+      // This base node HAS a Tool variant (e.g., nodes-base.supabase)
+      const toolVariantNodeType = `${node.nodeType}Tool`;
+      return {
+        isToolVariant: false,
+        hasToolVariant: true,
+        toolVariantNodeType,
+        guidance: `To use this node with AI Agents, use the Tool variant: ${toolVariantNodeType}. The Tool variant has an additional 'toolDescription' property and outputs 'ai_tool' instead of 'main'.`
+      };
+    }
+
+    return undefined;
+  }
+
   private getAIToolExamples(nodeType: string): any {
     const exampleMap: Record<string, any> = {
       'nodes-base.slack': {
@@ -2609,57 +3621,27 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
       throw new Error(`Node ${nodeType} not found`);
     }
     
-    // Get properties  
+    // Get properties
     const properties = node.properties || [];
-    
-    // Extract operation context (safely handle undefined config properties)
-    const operationContext = {
-      resource: config?.resource,
-      operation: config?.operation,
-      action: config?.action,
-      mode: config?.mode
+
+    // Add @version to config for displayOptions evaluation (supports _cnd operators)
+    const configWithVersion = {
+      '@version': node.version || 1,
+      ...(config || {})
     };
-    
+
     // Find missing required fields
     const missingFields: string[] = [];
-    
+
     for (const prop of properties) {
       // Skip if not required
       if (!prop.required) continue;
-      
-      // Skip if not visible based on current config
-      if (prop.displayOptions) {
-        let isVisible = true;
-        
-        // Check show conditions
-        if (prop.displayOptions.show) {
-          for (const [key, values] of Object.entries(prop.displayOptions.show)) {
-            const configValue = config?.[key];
-            const expectedValues = Array.isArray(values) ? values : [values];
-            
-            if (!expectedValues.includes(configValue)) {
-              isVisible = false;
-              break;
-            }
-          }
-        }
-        
-        // Check hide conditions
-        if (isVisible && prop.displayOptions.hide) {
-          for (const [key, values] of Object.entries(prop.displayOptions.hide)) {
-            const configValue = config?.[key];
-            const expectedValues = Array.isArray(values) ? values : [values];
-            
-            if (expectedValues.includes(configValue)) {
-              isVisible = false;
-              break;
-            }
-          }
-        }
-        
-        if (!isVisible) continue;
+
+      // Skip if not visible based on current config (uses ConfigValidator for _cnd support)
+      if (prop.displayOptions && !ConfigValidator.isPropertyVisible(prop, configWithVersion)) {
+        continue;
       }
-      
+
       // Check if field is missing (safely handle null/undefined config)
       if (!config || !(prop.name in config)) {
         missingFields.push(prop.displayName || prop.name);
@@ -3148,8 +4130,33 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
   }
   
   async shutdown(): Promise<void> {
+    // Prevent double-shutdown
+    if (this.isShutdown) {
+      logger.debug('Shutdown already called, skipping');
+      return;
+    }
+    this.isShutdown = true;
+
     logger.info('Shutting down MCP server...');
-    
+
+    // Wait for initialization to complete (or fail) before cleanup
+    // This prevents race conditions where shutdown runs while init is in progress
+    try {
+      await this.initialized;
+    } catch (error) {
+      // Initialization failed - that's OK, we still need to clean up
+      logger.debug('Initialization had failed, proceeding with cleanup', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Close MCP server connection (for consistency with close() method)
+    try {
+      await this.server.close();
+    } catch (error) {
+      logger.error('Error closing MCP server:', error);
+    }
+
     // Clean up cache timers to prevent memory leaks
     if (this.cache) {
       try {
@@ -3159,15 +4166,31 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
         logger.error('Error cleaning up cache:', error);
       }
     }
-    
-    // Close database connection if it exists
-    if (this.db) {
+
+    // Handle database cleanup based on whether it's shared or dedicated
+    // For shared databases, we only release the reference (decrement refCount)
+    // For dedicated databases (in-memory for tests), we close the connection
+    if (this.useSharedDatabase && this.sharedDbState) {
       try {
-        await this.db.close();
+        releaseSharedDatabase(this.sharedDbState);
+        logger.info('Released shared database reference');
+      } catch (error) {
+        logger.error('Error releasing shared database:', error);
+      }
+    } else if (this.db) {
+      try {
+        this.db.close();
         logger.info('Database connection closed');
       } catch (error) {
         logger.error('Error closing database:', error);
       }
     }
+
+    // Null out references to help garbage collection
+    this.db = null;
+    this.repository = null;
+    this.templateService = null;
+    this.earlyLogger = null;
+    this.sharedDbState = null;
   }
 }

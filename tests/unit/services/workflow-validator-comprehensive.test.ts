@@ -1067,7 +1067,7 @@ describe('WorkflowValidator - Comprehensive Tests', () => {
 
       const result = await validator.validateWorkflow(workflow as any);
 
-      expect(result.warnings.some(w => w.message.includes('Node is not connected to any other nodes') && w.nodeName === 'Orphaned')).toBe(true);
+      expect(result.warnings.some(w => w.message.includes('not reachable from any trigger node') && w.nodeName === 'Orphaned')).toBe(true);
     });
 
     it('should detect cycles in workflow', async () => {
@@ -1327,6 +1327,37 @@ describe('WorkflowValidator - Comprehensive Tests', () => {
       const result = await validator.validateWorkflow(workflow as any);
 
       expect(result.warnings.some(w => w.message.includes('AI Agent has no tools connected'))).toBe(true);
+    });
+
+    it('should NOT warn about AI agents WITH tools properly connected', async () => {
+      const workflow = {
+        nodes: [
+          {
+            id: '1',
+            name: 'Calculator Tool',
+            type: 'n8n-nodes-base.httpRequest',
+            position: [100, 100],
+            parameters: {}
+          },
+          {
+            id: '2',
+            name: 'Agent',
+            type: '@n8n/n8n-nodes-langchain.agent',
+            position: [300, 100],
+            parameters: {}
+          }
+        ],
+        connections: {
+          'Calculator Tool': {
+            ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]]
+          }
+        }
+      } as any;
+
+      const result = await validator.validateWorkflow(workflow as any);
+
+      // Should NOT have warning about missing tools
+      expect(result.warnings.some(w => w.message.includes('AI Agent has no tools connected'))).toBe(false);
     });
 
     it('should suggest community package setting for AI tools', async () => {
@@ -1956,7 +1987,7 @@ describe('WorkflowValidator - Comprehensive Tests', () => {
 
       // Warnings
       expect(result.warnings.some(w => w.message.includes('Connection to disabled node'))).toBe(true);
-      expect(result.warnings.some(w => w.message.includes('Node is not connected') && w.nodeName === 'Orphaned')).toBe(true);
+      expect(result.warnings.some(w => w.message.includes('not reachable from any trigger node') && w.nodeName === 'Orphaned')).toBe(true);
       expect(result.warnings.some(w => w.message.includes('AI Agent has no tools connected'))).toBe(true);
 
       // Statistics

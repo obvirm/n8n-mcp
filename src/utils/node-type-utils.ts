@@ -172,18 +172,18 @@ export function isTriggerNode(nodeType: string): boolean {
     return true;
   }
 
-  // Check for specific trigger types that don't have 'trigger' in their name
-  const specificTriggers = [
-    'nodes-base.start',
-    'nodes-base.manualTrigger',
-    'nodes-base.formTrigger'
-  ];
+  // Check for polling-based triggers that don't have 'trigger' in their name
+  if (lowerType.includes('emailread') || lowerType.includes('emailreadimap')) {
+    return true;
+  }
 
-  return specificTriggers.includes(normalized);
+  // Check for specific trigger types that don't have 'trigger' in their name
+  // (manualTrigger and formTrigger are already caught by the 'trigger' check above)
+  return normalized === 'nodes-base.start';
 }
 
 /**
- * Check if a node is an ACTIVATABLE trigger (excludes executeWorkflowTrigger)
+ * Check if a node is an ACTIVATABLE trigger
  *
  * This function determines if a node can be used to activate a workflow.
  * Returns true for:
@@ -191,25 +191,18 @@ export function isTriggerNode(nodeType: string): boolean {
  * - Time-based triggers (schedule, cron)
  * - Poll-based triggers (emailTrigger, slackTrigger, etc.)
  * - Manual triggers (manualTrigger, start, formTrigger)
- *
- * Returns FALSE for:
- * - executeWorkflowTrigger (can only be invoked by other workflows)
+ * - Sub-workflow triggers (executeWorkflowTrigger) - requires activation in n8n 2.0+
  *
  * Used for: Activation validation (active workflows need activatable triggers)
+ *
+ * NOTE: Since n8n 2.0, executeWorkflowTrigger workflows MUST be activated to work.
+ * This is a breaking change from pre-2.0 behavior.
  *
  * @param nodeType - The node type to check
  * @returns true if node can activate a workflow
  */
 export function isActivatableTrigger(nodeType: string): boolean {
-  const normalized = normalizeNodeType(nodeType);
-  const lowerType = normalized.toLowerCase();
-
-  // executeWorkflowTrigger cannot activate a workflow (invoked by other workflows)
-  if (lowerType.includes('executeworkflow')) {
-    return false;
-  }
-
-  // All other triggers can activate workflows
+  // All trigger nodes can activate workflows (including executeWorkflowTrigger in n8n 2.0+)
   return isTriggerNode(nodeType);
 }
 

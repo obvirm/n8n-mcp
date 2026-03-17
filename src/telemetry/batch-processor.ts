@@ -4,14 +4,47 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
-import { TelemetryEvent, WorkflowTelemetry, TELEMETRY_CONFIG, TelemetryMetrics } from './telemetry-types';
+import { TelemetryEvent, WorkflowTelemetry, WorkflowMutationRecord, TELEMETRY_CONFIG, TelemetryMetrics } from './telemetry-types';
 import { TelemetryError, TelemetryErrorType, TelemetryCircuitBreaker } from './telemetry-error';
 import { logger } from '../utils/logger';
+
+/**
+ * Convert camelCase key to snake_case
+ */
+function keyToSnakeCase(key: string): string {
+  return key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+}
+
+/**
+ * Convert WorkflowMutationRecord to Supabase-compatible format.
+ *
+ * IMPORTANT: Only converts top-level field names to snake_case.
+ * Nested workflow data (workflowBefore, workflowAfter, operations, etc.)
+ * is preserved EXACTLY as-is to maintain n8n API compatibility.
+ *
+ * The Supabase workflow_mutations table stores workflow_before and
+ * workflow_after as JSONB columns, which preserve the original structure.
+ * Only the top-level columns (user_id, session_id, etc.) require snake_case.
+ *
+ * Issue #517: Previously this used recursive conversion which mangled:
+ * - Connection keys (node names like "Webhook" → "_webhook")
+ * - Node field names (typeVersion → type_version)
+ */
+function mutationToSupabaseFormat(mutation: WorkflowMutationRecord): Record<string, any> {
+  const result: Record<string, any> = {};
+
+  for (const [key, value] of Object.entries(mutation)) {
+    result[keyToSnakeCase(key)] = value;
+  }
+
+  return result;
+}
 
 export class TelemetryBatchProcessor {
   private flushTimer?: NodeJS.Timeout;
   private isFlushingEvents: boolean = false;
   private isFlushingWorkflows: boolean = false;
+  private isFlushingMutations: boolean = false;
   private circuitBreaker: TelemetryCircuitBreaker;
   private metrics: TelemetryMetrics = {
     eventsTracked: 0,
@@ -23,8 +56,15 @@ export class TelemetryBatchProcessor {
     rateLimitHits: 0
   };
   private flushTimes: number[] = [];
-  private deadLetterQueue: (TelemetryEvent | WorkflowTelemetry)[] = [];
+  private deadLetterQueue: (TelemetryEvent | WorkflowTelemetry | WorkflowMutationRecord)[] = [];
   private readonly maxDeadLetterSize = 100;
+  // Track event listeners for proper cleanup to prevent memory leaks
+  private eventListeners: {
+    beforeExit?: () => void;
+    sigint?: () => void;
+    sigterm?: () => void;
+  } = {};
+  private started: boolean = false;
 
   constructor(
     private supabase: SupabaseClient | null,
@@ -39,6 +79,12 @@ export class TelemetryBatchProcessor {
   start(): void {
     if (!this.isEnabled() || !this.supabase) return;
 
+    // Guard against multiple starts (prevents event listener accumulation)
+    if (this.started) {
+      logger.debug('Telemetry batch processor already started, skipping');
+      return;
+    }
+
     // Set up periodic flushing
     this.flushTimer = setInterval(() => {
       this.flush();
@@ -50,17 +96,22 @@ export class TelemetryBatchProcessor {
       this.flushTimer.unref();
     }
 
-    // Set up process exit handlers
-    process.on('beforeExit', () => this.flush());
-    process.on('SIGINT', () => {
+    // Set up process exit handlers with stored references for cleanup
+    this.eventListeners.beforeExit = () => this.flush();
+    this.eventListeners.sigint = () => {
       this.flush();
       process.exit(0);
-    });
-    process.on('SIGTERM', () => {
+    };
+    this.eventListeners.sigterm = () => {
       this.flush();
       process.exit(0);
-    });
+    };
 
+    process.on('beforeExit', this.eventListeners.beforeExit);
+    process.on('SIGINT', this.eventListeners.sigint);
+    process.on('SIGTERM', this.eventListeners.sigterm);
+
+    this.started = true;
     logger.debug('Telemetry batch processor started');
   }
 
@@ -72,19 +123,33 @@ export class TelemetryBatchProcessor {
       clearInterval(this.flushTimer);
       this.flushTimer = undefined;
     }
+
+    // Remove event listeners to prevent memory leaks
+    if (this.eventListeners.beforeExit) {
+      process.removeListener('beforeExit', this.eventListeners.beforeExit);
+    }
+    if (this.eventListeners.sigint) {
+      process.removeListener('SIGINT', this.eventListeners.sigint);
+    }
+    if (this.eventListeners.sigterm) {
+      process.removeListener('SIGTERM', this.eventListeners.sigterm);
+    }
+    this.eventListeners = {};
+    this.started = false;
+
     logger.debug('Telemetry batch processor stopped');
   }
 
   /**
-   * Flush events and workflows to Supabase
+   * Flush events, workflows, and mutations to Supabase
    */
-  async flush(events?: TelemetryEvent[], workflows?: WorkflowTelemetry[]): Promise<void> {
+  async flush(events?: TelemetryEvent[], workflows?: WorkflowTelemetry[], mutations?: WorkflowMutationRecord[]): Promise<void> {
     if (!this.isEnabled() || !this.supabase) return;
 
     // Check circuit breaker
     if (!this.circuitBreaker.shouldAllow()) {
       logger.debug('Circuit breaker open - skipping flush');
-      this.metrics.eventsDropped += (events?.length || 0) + (workflows?.length || 0);
+      this.metrics.eventsDropped += (events?.length || 0) + (workflows?.length || 0) + (mutations?.length || 0);
       return;
     }
 
@@ -99,6 +164,11 @@ export class TelemetryBatchProcessor {
     // Flush workflows if provided
     if (workflows && workflows.length > 0) {
       hasErrors = !(await this.flushWorkflows(workflows)) || hasErrors;
+    }
+
+    // Flush mutations if provided
+    if (mutations && mutations.length > 0) {
+      hasErrors = !(await this.flushMutations(mutations)) || hasErrors;
     }
 
     // Record flush time
@@ -225,6 +295,71 @@ export class TelemetryBatchProcessor {
   }
 
   /**
+   * Flush workflow mutations with batching
+   */
+  private async flushMutations(mutations: WorkflowMutationRecord[]): Promise<boolean> {
+    if (this.isFlushingMutations || mutations.length === 0) return true;
+
+    this.isFlushingMutations = true;
+
+    try {
+      // Batch mutations
+      const batches = this.createBatches(mutations, TELEMETRY_CONFIG.MAX_BATCH_SIZE);
+
+      for (const batch of batches) {
+        const result = await this.executeWithRetry(async () => {
+          // Convert camelCase to snake_case for Supabase
+          const snakeCaseBatch = batch.map(mutation => mutationToSupabaseFormat(mutation));
+
+          const { error } = await this.supabase!
+            .from('workflow_mutations')
+            .insert(snakeCaseBatch);
+
+          if (error) {
+            // Enhanced error logging for mutation flushes
+            logger.error('Mutation insert error details:', {
+              code: (error as any).code,
+              message: (error as any).message,
+              details: (error as any).details,
+              hint: (error as any).hint,
+              fullError: String(error)
+            });
+            throw error;
+          }
+
+          logger.debug(`Flushed batch of ${batch.length} workflow mutations`);
+          return true;
+        }, 'Flush workflow mutations');
+
+        if (result) {
+          this.metrics.eventsTracked += batch.length;
+          this.metrics.batchesSent++;
+        } else {
+          this.metrics.eventsFailed += batch.length;
+          this.metrics.batchesFailed++;
+          this.addToDeadLetterQueue(batch);
+          return false;
+        }
+      }
+
+      return true;
+    } catch (error) {
+      logger.error('Failed to flush mutations with details:', {
+        errorMsg: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error
+      });
+      throw new TelemetryError(
+        TelemetryErrorType.NETWORK_ERROR,
+        'Failed to flush workflow mutations',
+        { error: error instanceof Error ? error.message : String(error) },
+        true
+      );
+    } finally {
+      this.isFlushingMutations = false;
+    }
+  }
+
+  /**
    * Execute operation with exponential backoff retry
    */
   private async executeWithRetry<T>(
@@ -305,7 +440,7 @@ export class TelemetryBatchProcessor {
   /**
    * Add failed items to dead letter queue
    */
-  private addToDeadLetterQueue(items: (TelemetryEvent | WorkflowTelemetry)[]): void {
+  private addToDeadLetterQueue(items: (TelemetryEvent | WorkflowTelemetry | WorkflowMutationRecord)[]): void {
     for (const item of items) {
       this.deadLetterQueue.push(item);
 
