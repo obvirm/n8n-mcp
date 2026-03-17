@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1761638228328,
-  "repoUrl": "https://github.com/czlonkowski/n8n-mcp",
+  "lastUpdate": 1773730351796,
+  "repoUrl": "https://github.com/obvirm/n8n-mcp",
   "entries": {
     "n8n-mcp Benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "56956555+czlonkowski@users.noreply.github.com",
-            "name": "Romuald Członkowski",
-            "username": "czlonkowski"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "e2c8fd0125d91e6040353c1c87b765c4d1657c92",
-          "message": "Merge pull request #283 from czlonkowski/update/n8n-and-templates-20251007\n\nUpdate n8n to v1.114.3 and optimize template fetching (v2.17.2)",
-          "timestamp": "2025-10-07T15:07:43+02:00",
-          "tree_id": "d1b46d94ffd8ed49dc683e5b84deb2c1d7effa96",
-          "url": "https://github.com/czlonkowski/n8n-mcp/commit/e2c8fd0125d91e6040353c1c87b765c4d1657c92"
-        },
-        "date": 1759842584773,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "sample - array sorting - small",
-            "value": 0.0193,
-            "range": "0.2432",
-            "unit": "ms",
-            "extra": "51864 ops/sec"
-          },
-          {
-            "name": "sample - array sorting - large",
-            "value": 3.2722,
-            "range": "1.7661000000000002",
-            "unit": "ms",
-            "extra": "306 ops/sec"
-          },
-          {
-            "name": "sample - string concatenation",
-            "value": 0.0051,
-            "range": "0.3578",
-            "unit": "ms",
-            "extra": "196871 ops/sec"
-          },
-          {
-            "name": "sample - object creation",
-            "value": 0.0663,
-            "range": "0.38939999999999997",
-            "unit": "ms",
-            "extra": "15080 ops/sec"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -1626,6 +1574,37 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/czlonkowski/n8n-mcp/commit/3f427f952836fd35cb6d054a45d179d88b9cb37b"
         },
         "date": 1761638228013,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sample - array sorting - small",
+            "value": 0.0136,
+            "range": "0.3096",
+            "unit": "ms",
+            "extra": "73341 ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "123351870+obvirm@users.noreply.github.com",
+            "name": "obvirm",
+            "username": "obvirm"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b35a14048b128ac8fb709792c7b0e172007bd820",
+          "message": "Merge branch 'czlonkowski:main' into main",
+          "timestamp": "2026-03-17T13:48:03+07:00",
+          "tree_id": "bbda8532e538438033b2af1bd22517b984e6a3c7",
+          "url": "https://github.com/obvirm/n8n-mcp/commit/b35a14048b128ac8fb709792c7b0e172007bd820"
+        },
+        "date": 1773730351422,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
